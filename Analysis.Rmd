@@ -1,0 +1,212 @@
+---
+title: "Cervical Cancer Classification"
+author: "rbabaei"
+date: "4/1/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = T)
+```
+
+## Introduction
+
+The 'Hospital Universitario de Caracas' in Caracas, Venezuela, has provided a dataset comprising of demographic information, habits, and historic medical records of 858 patients. Here the risk factors related to cervical cancer are going to be analysed, and a classification model based on provided information will be produced. The original data is accessible on : <https://archive.ics.uci.edu/ml/datasets/Cervical+cancer+%28Risk+Factors%29#>. 
+
+Please consider the citation quote as: "Kelwin Fernandes, Jaime S. Cardoso, and Jessica Fernandes. 'Transfer Learning with Partial Observability Applied to Cervical Cancer Screening.' Iberian Conference on Pattern Recognition and Image Analysis. Springer International Publishing, 2017.".
+
+## Data aquiry and setup
+
+First of all we load the data to the workplace and require the libraries.
+
+```{r readData}
+library(purrr)
+library(caret)
+library(ggplot2)
+library(ggcorrplot)
+library(dplyr)
+library(xgboost)
+library(VIM)
+library(missForest)
+library(doParallel)
+library(cowplot)
+rawData <- read.csv("risk_factors_cervical_cancer.csv", header = T)
+str(rawData)
+```
+
+## Data cleaning
+
+As we see most of the variables are not in correct format, which needs to be done first.
+
+```{r formatting}
+cols.num <- c(names(rawData[c(2:4,6,7,9,11,13,26,27,28)]))
+rawData[cols.num] <- sapply(rawData[cols.num], as.numeric)
+
+cols.num <- c(names(rawData[29:36]))
+rawData[,cols.num] <- lapply(rawData[,cols.num], factor)
+str(rawData)
+
+rm(cols.num)
+```
+
+The missing values are defined as "?". We'll replace them with NA.
+
+```{r missingValues}
+idmiss <- rawData == "?"
+is.na(rawData) <- idmiss
+rm(idmiss)
+str(rawData)
+```
+
+There are factor variables with only one level plus NA, which are not usefull for analysis. In addition, the "?" has been defined as a category. To fix it, we apply factor to the data once more.
+
+```{r correctNA}
+rawData$STDs.cervical.condylomatosis <- NULL
+rawData$STDs.AIDS <- NULL
+
+factor_index <- which(sapply(rawData[1:23], is.factor))
+name_index <- names(rawData[factor_index])
+
+rawData[name_index] <- lapply(rawData[name_index], factor)
+str(rawData)
+rm(factor_index, name_index)
+```
+
+### Imputation
+
+Before we go ahead to anaylse the data, we need to handle the missing values. We will map the missing values by variables in a table, and plot them to depict their distribution.
+
+```{r mapMiss}
+data.frame(map(rawData, ~sum(is.na(.)))) # 14 variables including NAs
+
+miss_plot <- aggr(rawData, col = c("navyblue", "yellow"),
+                  numbers = TRUE, sortVars = TRUE,
+                  labels = names(rawData),
+                  cex.axis = 0.7, gap = 3,
+                  ylab = c("Missing Data", "Pattern"))
+```
+
+Now, we will impute the missing values with the help of missForest package.
+
+```{r imputation}
+set.seed(145)
+
+# run parallel iteration
+registerDoParallel(cores = 3)
+impute_forest <- missForest(data.frame(rawData),maxiter = 10 ,ntree = 100, parallelize = "forests")
+stopImplicitCluster()
+
+# check imputation error
+impute_forest$OOBerror # the imputation is done for categorical variables with 0.2% error which is well acceptable
+imputed_data <- impute_forest$ximp
+```
+
+
+## Exploratory Data Analysis
+
+Now, our data frame is complete, without any missing values. We can take a look at its summary, and check for the correlation between the variables.
+
+```{r summary}
+summary(imputed_data)
+
+```
+
+There are several variables with near to zero variation and could be deleted. We first check the correlation between variables the decide to delete them.
+
+```{r correlation, fig.align="center", fig.height=20, fig.width=20, echo=FALSE}
+corr <- round(cor(sapply(imputed_data, as.numeric)),1)
+ggcorrplot(corr, hc.order = TRUE, 
+           type = "lower", 
+           lab = TRUE, 
+           lab_size = 3, 
+           method="circle", 
+           colors = c("tomato2", "white", "springgreen3"), 
+           title="Correlogram of Cervical Cancer Diagnosis", 
+           ggtheme=theme_bw)
+```
+
+Diagnosis of cancer is highly correlated with HPV, which is well known in the clinics. 20 variables showing correlation less than 0.02 to the diagnosis of Cancer (Dx.Cancer). These variables can be removed. We are going to continue with data as it is, until we build our first model and quntify its performance. Then we will decide to remove some attributes or not.
+
+At the end of this session we will plot two of the correlated measures to cancer to have a visualized overview.
+
+```{r plot,fig.align="center", echo=FALSE}
+
+P1 <- ggplot(imputed_data)
+P1 <- P1 + geom_boxplot(mapping = aes(x = Dx.Cancer, y = Age, fill = Dx.HPV))
+P1 <- P1 + labs(title = "Correlated to Age")
+
+P2 <- ggplot(imputed_data, aes(Dx.Cancer, Dx.HPV)) + geom_jitter(aes(color = Dx))
+P2 <- P2 + labs(title = "Correlated to HPV")
+theme_set(theme_cowplot(font_size = 10))
+P <- plot_grid(P1, P2)
+Title <- ggdraw() + draw_label("Cancer Diagnosis based on Age, HPV, and Diagnosis", x = 0, hjust = 0) + theme(plot.title = element_text(size = rel(1)))
+
+plot_grid(Title, P, ncol = 1, rel_heights = c(0.2,0.5))
+
+```
+Corresponding to the age, we can say that all patients older than 55 years old are negative to cervical cancer. As shown in correlation plot, there is a strong correlation between HPV infection and cervical cancer. 
+
+## Modeling
+
+To work easier let's bring the dependent variable to the beginning of the data frame.
+
+```{r }
+imputed_data <- imputed_data %>% select(Dx.Cancer, everything())
+```
+
+We divide the data to training and testing sets.
+
+```{r splitting}
+set.seed(331)
+
+intrain <- createDataPartition(y = imputed_data[,1], p = 0.8)[[1]]
+training <- imputed_data[intrain,]
+validation <- imputed_data[-intrain,]
+
+rm(intrain)
+```
+
+Now, we will model a gradient boost. Since our data set is relatively small, we apply cross validation as train control.
+
+```{r xgboost}
+registerDoParallel(cores = 3)
+
+set.seed(171)
+
+# 5-fold classification
+trctrl <- trainControl(method = "cv", number = 5)
+
+# train elastic net model
+gbFit <- train(Dx.Cancer ~., data = imputed_data,
+               method = "xgbTree",
+               trControl = trctrl,
+               # other parameters
+               tuneGrid = data.frame(nrounds = 200, eta = c(0.05, 0.1, 0.3),
+                                     max_depth = 4, gamma = 0, colsample_bytree = 1, subsample = 0.5,
+                                     min_child_weight = 1))
+
+stopImplicitCluster()
+```
+
+we can look at the best parameter by cross validation, we will plot the top 10 important variabless, and will check the performance of the model with our testing set.
+
+```{r bestTune}
+gbFit$bestTune
+
+```
+
+```{r varImp}
+plot(varImp(gbFit), top = 10)
+
+```
+
+As shown above, HPV is the most criteria for diagnosis and prediction of Cervical Cancer, as expected.
+
+```{r performance}
+class.res <- predict(gbFit, validation[,-1])
+confusionMatrix(validation[,1], class.res)$overall[1]
+```
+
+With accuracy of 1 this model is highly reliable, and can be further validated with new datasets.
+
+

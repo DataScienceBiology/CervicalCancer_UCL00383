@@ -50,7 +50,7 @@ miss_plot <- aggr(rawData, col = c("navyblue", "yellow"),
                   ylab = c("Missing Data", "Pattern"))
 
 # before imputing let's check for suspected identical variables (Dx.Cancer and Dx)
-identical(rawData[["Dx.Cancer"]], rawData[["Dx"]]) # they are not the same
+# identical(rawData[["Dx.Cancer"]], rawData[["Dx"]]) # they are not the same
 
 # imputing missing values
 
